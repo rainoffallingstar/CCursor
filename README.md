@@ -50,7 +50,7 @@ npx @cometix/ccursor status
 - **Error Banner** — LLM errors surface as Cursor's native retry banner with retryable/non-retryable classification
 - **Per-Window Logging** — Each window gets its own log stream, colored output in LogOutputChannel
 - **Hot-Reload** — Config changes take effect without restarting Cursor
-- **22 Agent Tools** — Shell, Read, Grep, Glob, StrReplace, Write, Task, MCP, etc.
+- **24 Agent Tools** — Shell, Read, Grep, Glob, Edit, Write, Task, MCP, etc.
 - **Hub Integration** — Device authorization via LinuxDO Connect
 
 ---
@@ -141,7 +141,7 @@ Requires **Cursor IDE** + **Node.js >= 18**.
 
 ## Issues & Feedback
 
-This repository is for **issue tracking and documentation only** — source code is not published.
+Source code for the extension (`Cursor++/`) and the installer (`installer/`) lives in this repository, licensed under AGPL-3.0-or-later.
 
 - [Submit an Issue](https://github.com/CometixSpace/CCursor/issues)
 - [LinuxDO Discussion](https://linux.do/t/topic/1926833)
