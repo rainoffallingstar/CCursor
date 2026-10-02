@@ -40,6 +40,7 @@ import {
     type SubagentModelCatalog,
     type SubagentModelSelection,
 } from './subagentCatalog';
+import type { TaskEntryTruncationContext } from './toolkit/results/taskToolResults';
 
 type SubagentModelOverride = ParsedRunRequest['subagentModelOverrides'][number];
 
@@ -52,6 +53,8 @@ export interface TaskLaunchContext {
     cursorToolType: string;
     conversationId: string;
     modelSelection: Extract<SubagentModelSelection, { case: 'selected' }>;
+    /** 入口截断上下文 — Task 报告超 ENTRY_CAP 时据此截断 + spill (设计文档 §3.2) */
+    entryTruncation?: TaskEntryTruncationContext;
 }
 
 function finalizeTaskRejection(params: {
@@ -119,6 +122,8 @@ export async function* runToolCall(params: {
     cursorDynamicTools?: CursorDynamicToolDefinition[];
     /** Cursor agent projectDir;大 discovery 结果写入其 agent-tools 子目录。 */
     projectDir?: string;
+    /** 会话上下文窗口 — Task 报告入口截断按 min(25K, 25%×窗口) 缩放 (设计文档 §3.2) */
+    contextTokenLimit?: number;
 }): AsyncGenerator<AgentServerMessage, void, void> {
     yield* runToolCallInner(params);
 }
@@ -409,6 +414,9 @@ async function* runToolCallInner(params: Parameters<typeof runToolCall>[0]): Asy
             messages: params.messages,
             imageCollector: params.imageCollector,
             readContext: params.readContext,
+            entryTruncation: cursorToolType === 'taskToolCall'
+                ? { conversationId: params.conversationId, contextTokenLimit: params.contextTokenLimit, toolCallId: tc.callId }
+                : undefined,
         });
         return;
     }
@@ -788,6 +796,8 @@ export async function* launchTaskTool(params: {
     messages: LLMMessage[];
     /** cursor namespace 已注册的内置工具 —— Task 经 CallDynamicTool 进来时据此解包 */
     cursorDynamicTools?: AvailableDynamicBuiltinTool[];
+    /** 会话上下文窗口 — Task 报告入口截断按 min(25K, 25%×窗口) 缩放 */
+    contextTokenLimit?: number;
 }): AsyncGenerator<AgentServerMessage, TaskLaunchContext | null, void> {
     const tc = params.toolCall;
     const resolvedTool = resolveToolCall(
@@ -926,6 +936,11 @@ export async function* launchTaskTool(params: {
         cursorToolType,
         conversationId: params.conversationId,
         modelSelection: selection,
+        entryTruncation: {
+            conversationId: params.conversationId,
+            contextTokenLimit: params.contextTokenLimit,
+            toolCallId: tc.callId,
+        },
     };
 }
 
@@ -982,6 +997,7 @@ export function finalizeTaskResult(
             rawToolResult: buildExecToolResult(ctx.cursorToolType, ecm, ctx.sanitizedInput),
             input: ctx.sanitizedInput,
             modelCallId: ctx.modelCallId,
+            entryTruncation: ctx.entryTruncation,
         });
         return finalized.frame;
     }

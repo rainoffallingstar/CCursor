@@ -11,23 +11,72 @@ import { decodeBlob } from './blob'
 import { cacheBlob, getCachedBlob } from './blobStore'
 import { emitFinalCheckpoint, emitRollingCheckpoint } from './checkpointManager'
 import { ContextTokenTracker } from './tokenCounter'
-import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from './compactionStrategy'
+import { buildSummarySource, createCompactionArtifacts, estimateMessagesTokens, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy'
+import { getCompactionContentionCount, isCompactionLockHeld, releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock'
 import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob } from './historyManager'
 import { buildMessages, workspaceUris } from './protocol'
 import { checkpoint, editToolCallStreamDelta, heartbeat, kvMessage, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
-import { buildSummaryUserMessage, SUMMARY_SYSTEM_PROMPT } from './summaryPrompt'
 import { finalizeTaskResult, launchTaskTool, runToolCall, type TaskLaunchContext } from './toolRuntime'
 import { awaitExecResultAndClose, isAgentRunAbortedError, isSessionCancellationError, throwIfSessionCancelled, waitForPromiseWithHeartbeat } from './wait'
 import { restoreBlobMessageToLLMMessage } from './transcript'
 import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from './turnTracker'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools, createSubagentModelCatalog } from './subagentCatalog'
-import { addUsage, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, shouldTriggerCompaction } from './usage'
+import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, isContextLengthLimitError, shouldTriggerCompaction } from './usage'
+import { AGENT_HEARTBEAT_INTERVAL_MS, CONTEXT_LENGTH_RETRY_MAX } from './constants'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
 import { createRepairDiagnostics, hasRepairMutations, repairConversationHistory } from '../llm/transformMessages'
 
 const LEADING_DASH_RE = /^-\s*/
+
+/**
+ * SSE 保活哨兵 (2026-08-29 二次实弹修正): 摘要流消费循环的心跳必须定时驱动。
+ * 思考模型摘要期零事件 → 事件驱动心跳饿死 → SSE 静默 ~93s → Cursor 客户端
+ * stall 判死弃 run 重发, 在飞行摘要作废且并发 run 续涨上下文。
+ */
+export const HEARTBEAT_TICK: unique symbol = Symbol('summary-heartbeat-tick')
+
+/**
+ * 包装摘要事件流: 源流静默超过 AGENT_HEARTBEAT_INTERVAL_MS 时产出
+ * HEARTBEAT_TICK, 消费方转发为 SSE heartbeat, 与源流事件无关地维持连接活性。
+ */
+export async function* pumpWithTimedHeartbeats<TEvent>(
+  sourceStream: AsyncIterable<TEvent>,
+  heartbeatIntervalMs: number = AGENT_HEARTBEAT_INTERVAL_MS,
+): AsyncGenerator<TEvent | typeof HEARTBEAT_TICK, void, void> {
+  const sourceIterator = sourceStream[Symbol.asyncIterator]()
+  let pendingStep: Promise<IteratorResult<TEvent>> | null = null
+  try {
+    while (true) {
+      // 复用未决的 next(): 心跳分支返回后源 promise 仍在飞行, 不可重复调用 next()
+      pendingStep = pendingStep ?? sourceIterator.next()
+      let timerId: ReturnType<typeof setTimeout> | undefined
+      const tickPromise = new Promise<typeof HEARTBEAT_TICK>((resolveTick) => {
+        timerId = setTimeout(() => resolveTick(HEARTBEAT_TICK), heartbeatIntervalMs)
+      })
+      let raceOutcome: IteratorResult<TEvent> | typeof HEARTBEAT_TICK
+      try {
+        raceOutcome = await Promise.race([pendingStep, tickPromise])
+      }
+      finally {
+        clearTimeout(timerId)
+      }
+      if (raceOutcome === HEARTBEAT_TICK) {
+        yield HEARTBEAT_TICK
+        continue
+      }
+      pendingStep = null
+      if (raceOutcome.done)
+        return
+      yield raceOutcome.value
+    }
+  }
+  finally {
+    // 消费方提前退出 (run 取消): 不 await return() — 源可能悬在内部 await
+    void Promise.resolve().then(() => sourceIterator.return?.()).catch(() => {})
+  }
+}
 
 const EDIT_TOOL_NAMES = new Set(['ApplyPatch', 'Edit', 'Write', 'EditNotebook'])
 
@@ -518,11 +567,52 @@ async function* performInlineAutoSummarize(params: {
   messages: LLMMessage[]
   route: ReturnType<typeof resolveProviderRuntime>
   readPaths: string[]
+  budgetOverride?: number
 }): AsyncGenerator<AgentServerMessage, {
   newBlobIds: string[]
   newSummaryArchiveIds: string[]
   newUsedTokens: number
   newMessages: LLMMessage[]
+  /** 本轮规划实际采用的基准预算 (错误驱动重试的 budget/2^retry 被除数) */
+  baseBudgetTokens: number
+} | 'lock-held' | null> {
+  const { parsed } = params
+
+  // 并发互斥 (设计文档 §7#7): inline 触发时锁被占 → 本轮跳过, 下轮重试。
+  // F5 修正 (2026-08-29 实弹): 返回 'lock-held' 哨兵而非 null —
+  // 锁被占意味着另一路压缩正在进行, 不是压缩失败, 不得计入熔断计数
+  // (实弹曾观测: 慢摘要占锁 → 并发 run 三连撞锁 → 熔断误开 → 压缩被永久关停)。
+  if (!tryAcquireCompactionLock(parsed.conversationId)) {
+    logger.warn({
+      conversationId: parsed.conversationId,
+      contentionCount: getCompactionContentionCount(parsed.conversationId),
+    }, '[AUTOCOMPACT] compaction lock held (another compaction in flight) — skipping this round without counting failure')
+    return 'lock-held'
+  }
+  try {
+    return yield* performInlineAutoSummarizeLocked(params)
+  }
+  finally {
+    releaseCompactionLock(parsed.conversationId)
+  }
+}
+
+async function* performInlineAutoSummarizeLocked(params: {
+  parsed: ParsedRunRequest
+  allBlobIds: string[]
+  summaryArchiveIds: string[]
+  usedTokensEstimate: number
+  contextTokenLimit: number
+  messages: LLMMessage[]
+  route: ReturnType<typeof resolveProviderRuntime>
+  readPaths: string[]
+  budgetOverride?: number
+}): AsyncGenerator<AgentServerMessage, {
+  newBlobIds: string[]
+  newSummaryArchiveIds: string[]
+  newUsedTokens: number
+  newMessages: LLMMessage[]
+  baseBudgetTokens: number
 } | null> {
   const { parsed, allBlobIds, summaryArchiveIds, usedTokensEstimate, contextTokenLimit, route } = params
 
@@ -530,65 +620,100 @@ async function* performInlineAutoSummarize(params: {
   if (historyEntries.length === 0)
     return null
 
-  const compactionPlan = planCompaction(historyEntries)
+  const compactionPlan = planCompaction(historyEntries, {
+    contextTokenLimit,
+    budgetOverride: params.budgetOverride,
+  })
+
+  // 小窗结构性不可行终态: 停用自动压缩并告警 (拒动为合格终态, 设计文档 #10)
+  if (compactionPlan.mode === 'disabled') {
+    logger.error({
+      conversationId: parsed.conversationId,
+      contextTokenLimit,
+      diagnostics: compactionPlan.diagnostics,
+    }, '[AUTOCOMPACT] planCompaction disabled — skipping compaction (see guidance above)')
+    return null
+  }
+
   if (compactionPlan.summarizeEntries.length === 0) {
     logger.info({ conversationId: parsed.conversationId }, '[AGENT] auto-summarize: nothing to compact')
     return null
   }
 
+  // keepTail 构成观测: 占位命中数 / 实占 token / 前沿超额 / 违约与升级链事件
+  const planDiagnostics = compactionPlan.diagnostics
+  const keepTailEntries = compactionPlan.keepTail.map(entry => ({
+    role: entry.message.role,
+    toolName: entry.message.toolName,
+    isPlaceholder: typeof entry.message.content === 'string'
+      ? entry.message.content.includes('[tool output elided during context compaction')
+      : false,
+    tokens: measureMessagesTokens([entry.message]),
+  }))
   logger.info({
     conversationId: parsed.conversationId,
+    compactionStartedAt: new Date().toISOString(),
     totalEntries: historyEntries.length,
     summarizeCount: compactionPlan.summarizeEntries.length,
     keepTailCount: compactionPlan.keepTail.length,
     leadingCount: compactionPlan.leading.length,
+    keepTailTokens: keepTailEntries,
+    placeholderHits: planDiagnostics.placeholderCount,
+    inputElidedCount: planDiagnostics.inputElidedCount,
+    anchorInserted: planDiagnostics.anchorInserted,
+    escalationLevel: planDiagnostics.escalationLevel,
+    floorViolation: planDiagnostics.floorViolation,
+    frontierExcessTokens: planDiagnostics.frontierExcessTokens,
+    firstConsumptionLossCount: planDiagnostics.firstConsumptionLossCount,
+    budgetTokens: planDiagnostics.budgetTokens,
+    largeEntryLineTokens: planDiagnostics.largeEntryLineTokens,
     usedTokensEstimate,
     contextTokenLimit,
+    aggressiveRetry: params.budgetOverride !== undefined,
   }, '[AGENT] auto-summarize: starting inline compaction')
 
   yield summaryStarted()
 
-  const summarySourceText = compactionPlan.summarizeEntries
-    .map(entry => formatMessageForSummary(entry.message))
-    .filter(text => text.length > 0)
-    .join('\n\n')
+  // 摘要源构造 (阶段 4): 总预算 min(0.6×窗口×4, 3.2e6) chars, 超限走 max-min 水位分配
+  const summarySourceText = buildSummarySource(compactionPlan.summarizeEntries, { contextTokenLimit })
 
+  const llmStartTime = Date.now()
+  logger.info({
+    conversationId: parsed.conversationId,
+    sourceTextLen: summarySourceText.length,
+    summarizeEntries: compactionPlan.summarizeEntries.length,
+    keepTail: compactionPlan.keepTail.length,
+  }, '[SUMMARIZE] LLM summary starting')
+
+  // 三级兜底 (流式): ≤3 次重试 (源预算递减 + shorter-output 指令) → 确定性降级 → 占位文本;
+  // SUMMARY_HARD_CAP: 产出超 2×预留 → shorter-output 重试 → token 级裁剪。
+  // 心跳必须定时驱动 (2026-08-29 二次实弹): 思考模型摘要期零事件, 事件驱动心跳
+  // 会饿死 → SSE 静默 ~93s → 客户端 stall 判死弃 run 重发 → 摘要成果作废 +
+  // 并发 run 续涨上下文 → 背靠背二次压缩 (三次实测 92.5/92.7/95.0s 一致实锤)。
   let summaryText = ''
-  try {
-    const llmStream = route.provider.stream({
-      model: route.model,
-      thinking: false,
-      messages: [
-        { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-        { role: 'user', content: buildSummaryUserMessage(summarySourceText) },
-      ],
-    })
-
-    for await (const event of llmStream) {
-      if (event.type === 'text_delta') {
-        summaryText += event.text
-        yield summary(event.text)
-      }
+  for await (const summaryEvent of pumpWithTimedHeartbeats(streamSummaryWithFallback({
+    provider: route.provider,
+    model: route.model,
+    sourceText: summarySourceText,
+    contextTokenLimit,
+  }))) {
+    if (summaryEvent === HEARTBEAT_TICK) {
+      yield heartbeat()
+      continue
     }
-  }
-  catch (error) {
-    logger.warn({ error: (error as Error).message }, '[AGENT] auto-summarize: LLM failed, using local fallback')
+    if (summaryEvent.type === 'delta') {
+      summaryText += summaryEvent.text
+      yield summary(summaryEvent.text)
+    }
+    if (summaryEvent.type === 'done')
+      summaryText = summaryEvent.text
   }
 
-  summaryText = summaryText.trim()
-  if (!summaryText) {
-    summaryText = summarySourceText
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean)
-      .slice(0, 12)
-      .map(line => `- ${line.replace(LEADING_DASH_RE, '')}`)
-      .join('\n')
-      .slice(0, 4000)
-  }
-  if (!summaryText) {
-    summaryText = '- Prior conversation compacted.'
-  }
+  logger.info({
+    conversationId: parsed.conversationId,
+    summaryLen: summaryText.length,
+    durationMs: Date.now() - llmStartTime,
+  }, '[SUMMARIZE] LLM summary done')
 
   const artifacts = createCompactionArtifacts({
     plan: compactionPlan,
@@ -601,8 +726,9 @@ async function* performInlineAutoSummarize(params: {
     yield kvMessage(2 + index, archiveBlob.blobId, archiveBlob.blobData, archiveBlob.blobDataRaw)
   }
 
+  // o200k 实测重置 (替代 chars/4): 重置精度直接决定 provider usage 反弹差大小
   const compactedTokenDetails = clampTokenDetails(
-    estimateMessagesTokens([
+    measureMessagesTokens([
       ...compactionPlan.leading.map(entry => entry.message),
       { role: 'assistant', content: `Previous conversation summary:\n${artifacts.summaryText}` },
       ...compactionPlan.keepTail.map(entry => entry.message),
@@ -610,6 +736,15 @@ async function* performInlineAutoSummarize(params: {
     contextTokenLimit,
   )
 
+  logger.info({
+    conversationId: parsed.conversationId,
+    origin: 'inline',
+    kind: 'committed',
+    usedTokens: compactedTokenDetails.usedTokens,
+    maxTokens: compactedTokenDetails.maxTokens,
+    rootBlobCount: artifacts.nextRootBlobIds.length,
+    summaryArchiveCount: artifacts.nextSummaryArchiveIds.length,
+  }, '[AUTOCOMPACT] checkpoint write')
   persistConversationCheckpoint({ kind: 'committed',
     conversationId: parsed.conversationId,
     rootBlobIds: artifacts.nextRootBlobIds,
@@ -678,6 +813,7 @@ async function* performInlineAutoSummarize(params: {
     newSummaryArchiveIds: artifacts.nextSummaryArchiveIds,
     newUsedTokens: compactedTokenDetails.usedTokens,
     newMessages: repairedNewMessages,
+    baseBudgetTokens: compactionPlan.diagnostics.budgetTokens,
   }
 }
 
@@ -691,6 +827,17 @@ export async function* handleConversationRun(
     parsed.contextTokenLimit = route.contextTokenLimit
   }
   const contextTokenLimit = parsed.contextTokenLimit ?? route.contextTokenLimit
+  // contextTokenLimit<=0 (providers.json 未配置 context 且客户端未下发 parameters.context)
+  // 会使阈值变负 -> shouldTriggerCompaction 恒真 -> 每个工具轮都压缩。显式禁用并告警。
+  const autoCompactEnabled = contextTokenLimit > 0
+  if (!autoCompactEnabled) {
+    logger.warn({
+      conversationId: parsed.conversationId,
+      modelId: parsed.modelId,
+      routeContextTokenLimit: route.contextTokenLimit,
+      requestedContextTokenLimit,
+    }, '[AGENT] auto-compact disabled: non-positive contextTokenLimit — configure providers.json context or send parameters.context')
+  }
   logger.debug({
     conversationId: parsed.conversationId,
     modelId: parsed.modelId,
@@ -865,6 +1012,12 @@ export async function* handleConversationRun(
   // 不再用 autoSummarizePerformed 一次性限制——每轮都可重复触发,直至连续失败 3 次停止
   let autoCompactConsecutiveFailures = 0
   const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+  // 上次"有效"压缩后的估算基线; 净增长门槛的参照点 (0 = 本 run 尚未压缩过)
+  let lastCompactionBaseline = 0
+  // 错误驱动压缩重试计数 (≤3 轮硬封顶) 与首次压缩基准预算 (budget/2^retry 的被除数)
+  let contextLengthRetryCount = 0
+  let baseKeepTailBudget = 0
+  let firstCompactionAt = 0
   const syntheticUserMessageId = parsed.isBackgroundTaskCompletion
     ? `background-completion-${Date.now()}`
     : parsed.rawUserMessage?.messageId && typeof parsed.rawUserMessage.messageId === 'string'
@@ -974,10 +1127,26 @@ export async function* handleConversationRun(
   logger.info(`[AGENT] → [${route.provider.name}/${route.model}] "${userPreview}" (${messages.length} msgs)`)
 
   const usageTotals = emptyUsageTotals()
-  let usedTokensEstimate = Math.max(
-    parsed.historyTokenDetails?.usedTokens ?? 0,
-    estimateMessagesTokens(messages),
-  )
+  // 估算来源归因: 记录 usedTokensEstimate 当前由哪把尺子顶到该值
+  // ('client-inherited' = 客户端回传的 checkpoint 值 | 'chars/4' | 'provider')
+  let estimateSource: 'client-inherited' | 'chars/4' | 'provider' = 'chars/4'
+  const clientInheritedTokens = parsed.historyTokenDetails?.usedTokens ?? 0
+  const charsInitTokens = estimateMessagesTokens(messages)
+  if (clientInheritedTokens > 0 && clientInheritedTokens >= charsInitTokens)
+    estimateSource = 'client-inherited'
+  let usedTokensEstimate = Math.max(clientInheritedTokens, charsInitTokens)
+  logger.info({
+    conversationId: parsed.conversationId,
+    isSubagent: parsed.isSubagent,
+    historyTokenDetails: parsed.historyTokenDetails,
+    routeContextTokenLimit: route.contextTokenLimit,
+    contextTokenLimit,
+    clientInheritedTokens,
+    charsInitTokens,
+    initialEstimate: usedTokensEstimate,
+    estimateSource,
+    autoCompactEnabled,
+  }, '[AUTOCOMPACT] run start baseline')
   let lastAssistantContent: LLMContentBlock[] | undefined
   let stepCounter = 0
 
@@ -1155,15 +1324,37 @@ export async function* handleConversationRun(
             }
             break
           }
-          case 'done':
+          case 'done': {
             ({ currentThinking, currentText } = flushPendingAssistantPrefix({
               roundAssistantBlocks,
               currentThinking,
               currentText,
             }))
             Object.assign(usageTotals, addUsage(usageTotals, event.usage))
-            usedTokensEstimate = Math.max(usedTokensEstimate, estimateContextTokens(event.usage))
+            const estimateBefore = usedTokensEstimate
+            const providerEstimate = estimateContextTokens(event.usage)
+            if (providerEstimate > usedTokensEstimate)
+              estimateSource = 'provider'
+            usedTokensEstimate = Math.max(usedTokensEstimate, providerEstimate)
+            // 尺子差观测点: inputTokens(全量,含脚手架) 与 chars/4(仅对话消息) 的差
+            // 即"脚手架 + tokenizer 偏差"的实测值, 用于校准压缩重置的自校准补偿
+            const charsEstimate = estimateMessagesTokens(messages)
+            logger.info({
+              conversationId: parsed.conversationId,
+              round,
+              inputTokens: event.usage.inputTokens,
+              outputTokens: event.usage.outputTokens,
+              cacheReadTokens: event.usage.cacheReadTokens ?? 0,
+              cacheWriteTokens: event.usage.cacheWriteTokens ?? 0,
+              providerEstimate,
+              charsEstimate,
+              scaffoldDelta: Math.max(0, (event.usage.inputTokens ?? 0) - charsEstimate),
+              estimateBefore,
+              estimateAfter: usedTokensEstimate,
+              estimateSource,
+            }, '[AUTOCOMPACT] provider usage latch')
             break
+          }
         }
       }, undefined, (event) => {
         if (event.type === 'tool_use_start')
@@ -1191,6 +1382,79 @@ export async function* handleConversationRun(
           reason: session?.cancelledReason,
         }, '[CANCEL] LLM stream aborted by client')
         return
+      }
+
+      // 错误驱动压缩重试 (设计文档 §4 运行时层, 官方 CC-001/017):
+      // provider 报 context-length 类错误 → aggressive 压缩 (预算 /2^retry)
+      // → 重发本轮请求, ≤3 轮硬封顶; 非白名单错误走现状路径。
+      if (autoCompactEnabled && isContextLengthLimitError(e) && contextLengthRetryCount < CONTEXT_LENGTH_RETRY_MAX) {
+        contextLengthRetryCount += 1
+        // aggressive 预算: 基准预算 / 2^retry (未压缩过时按 targetFloor 估计基准)
+        const effectiveBaseBudget = baseKeepTailBudget > 0
+          ? baseKeepTailBudget
+          : Math.floor(0.25 * contextTokenLimit)
+        const aggressiveBudget = Math.max(1, Math.floor(effectiveBaseBudget / 2 ** contextLengthRetryCount))
+        logger.warn({
+          conversationId: parsed.conversationId,
+          round,
+          retry: contextLengthRetryCount,
+          maxRetries: CONTEXT_LENGTH_RETRY_MAX,
+          aggressiveBudget,
+          error: (e as Error).message,
+        }, '[AUTOCOMPACT] context-length error — retrying with aggressive compaction')
+        let retryCompactionResult = yield* performInlineAutoSummarize({
+          parsed,
+          allBlobIds: [...parsed.historyBlobIds, ...blobIds],
+          summaryArchiveIds: currentSummaryArchiveIds,
+          usedTokensEstimate,
+          contextTokenLimit,
+          messages,
+          route,
+          readPaths: [...readContext.readPaths],
+          budgetOverride: aggressiveBudget,
+        })
+        if (retryCompactionResult === 'lock-held') {
+          // 上下文已爆窗, 唯一出路是压缩 — 学官方 WaitForCompletion 形态纯等
+          // 持锁压缩完成 (无 deadline; 持锁者有界性由 idle 超时 + 兜底梯子保证),
+          // 心跳保 SSE 活性, 释放后用本 run 视图重压一次
+          logger.warn({
+            conversationId: parsed.conversationId,
+            round,
+            retry: contextLengthRetryCount,
+          }, '[AUTOCOMPACT] context-length retry blocked by in-flight compaction — waiting for lock release')
+          while (isCompactionLockHeld(parsed.conversationId)) {
+            await Promise.race([
+              waitForCompactionLockRelease(parsed.conversationId),
+              new Promise(resolveSleep => setTimeout(resolveSleep, 4_000)),
+            ])
+            yield heartbeat()
+          }
+          const secondAttempt = yield* performInlineAutoSummarize({
+            parsed,
+            allBlobIds: [...parsed.historyBlobIds, ...blobIds],
+            summaryArchiveIds: currentSummaryArchiveIds,
+            usedTokensEstimate,
+            contextTokenLimit,
+            messages,
+            route,
+            readPaths: [...readContext.readPaths],
+            budgetOverride: aggressiveBudget,
+          })
+          retryCompactionResult = secondAttempt === 'lock-held' ? null : secondAttempt
+        }
+        // 至此 'lock-held' 已被上方分支消解 (TS 控制流可证), 仅剩成功对象或 null
+        if (retryCompactionResult !== null) {
+          messages = retryCompactionResult.newMessages
+          parsed.historyBlobIds = retryCompactionResult.newBlobIds
+          currentSummaryArchiveIds = retryCompactionResult.newSummaryArchiveIds
+          usedTokensEstimate = retryCompactionResult.newUsedTokens
+          blobIds = []
+          blobCounter = 0
+          nextBlobbedMessageIndex = messages.length
+          lastCompactionBaseline = usedTokensEstimate
+          round-- // 重发本轮请求: for-loop 递增后回到同一 round
+          continue
+        }
       }
 
       // 关键: 不再往对话流 yield textDelta('[BYOK Error] ...') —— 那会让错误文本
@@ -1254,6 +1518,7 @@ export async function* handleConversationRun(
             cursorDynamicTools: parsed.cursorDynamicTools,
             roundContext,
             messages,
+            contextTokenLimit,
           })
           let launchStep = await launchIterator.next()
           while (!launchStep.done) {
@@ -1299,6 +1564,7 @@ export async function* handleConversationRun(
           supportsMcpAuth: parsed.supportsMcpAuth,
           cursorDynamicTools: parsed.cursorDynamicTools,
           projectDir: parsed.env.projectFolder ?? parsed.env.workspacePaths?.[0],
+          contextTokenLimit,
         })
         for await (const frame of toolFrames) {
           const completedToolCall = extractCompletedToolCall(frame)
@@ -1389,7 +1655,10 @@ export async function* handleConversationRun(
         blobIds,
       ))
 
-      usedTokensEstimate = Math.max(usedTokensEstimate, estimateMessagesTokens(messages))
+      const charsLatch = estimateMessagesTokens(messages)
+      if (charsLatch > usedTokensEstimate)
+        estimateSource = 'chars/4'
+      usedTokensEstimate = Math.max(usedTokensEstimate, charsLatch)
 
       const allBlobIdsForCheckpoint = [...parsed.historyBlobIds, ...blobIds]
       const materializedTurnBlob = activeTurn?.materializeTurnBlob()
@@ -1417,14 +1686,39 @@ export async function* handleConversationRun(
       // 链路①: 服务端 Agent Run 内自动 summarize
       // 每轮都检查——超阈值就触发 compaction,可重复触发,连续失败 3 次才熔断
       // (对齐 Claude Code autoCompactIfNeeded 的 consecutiveFailures 熔断机制)
-      if (autoCompactConsecutiveFailures < MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
-        && shouldTriggerCompaction(usedTokensEstimate, contextTokenLimit)) {
+      //
+      // 两道防抖 (诊断报告 §8.1):
+      //   1. 净增长门槛: 距上次有效压缩基线的净增长 >= 15K 才允许再次触发,
+      //      打断"压缩后 provider usage 立刻反弹 -> 读一个文件就再压"的锯齿循环;
+      //   2. 硬安全线: 距窗口上限不足 8K 时无视门槛立即压缩,不为等门槛撑爆窗口。
+      // 阈值传入 route 真实 maxOutputTokens, 恢复注释宣称的 40K 余量 (此前恒为默认 8192, 仅 28K)。
+      const autoCompactThreshold = getAutoCompactThreshold(contextTokenLimit, route.maxOutputTokens)
+      const overThreshold = autoCompactEnabled
+        && shouldTriggerCompaction(usedTokensEstimate, contextTokenLimit, undefined, route.maxOutputTokens)
+      const netGrowthSinceCompaction = usedTokensEstimate - lastCompactionBaseline
+      const netGrowthOk = netGrowthSinceCompaction >= AUTOCOMPACT_NET_GROWTH_MIN_TOKENS
+      const hardPressure = usedTokensEstimate >= contextTokenLimit - Math.min(contextTokenLimit, 8192)
+      if (overThreshold && !netGrowthOk && !hardPressure) {
+        logger.info({
+          conversationId: parsed.conversationId,
+          round,
+          usedTokensEstimate,
+          threshold: autoCompactThreshold,
+          lastCompactionBaseline,
+          netGrowthSinceCompaction,
+          netGrowthMin: AUTOCOMPACT_NET_GROWTH_MIN_TOKENS,
+          estimateSource,
+        }, '[AGENT] auto-summarize: net-growth gate holds, skipping compaction')
+      } else if (overThreshold && autoCompactConsecutiveFailures < MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES) {
         logger.info({
           conversationId: parsed.conversationId,
           round,
           usedTokensEstimate,
           contextTokenLimit,
-          threshold: getAutoCompactThreshold(contextTokenLimit),
+          threshold: autoCompactThreshold,
+          maxOutputTokens: route.maxOutputTokens,
+          estimateSource,
+          hardPressure,
           consecutiveFailures: autoCompactConsecutiveFailures,
         }, '[AGENT] auto-summarize: threshold exceeded, triggering inline compaction')
 
@@ -1439,7 +1733,14 @@ export async function* handleConversationRun(
           readPaths: [...readContext.readPaths],
         })
 
-        if (compactionResult) {
+        if (compactionResult === 'lock-held') {
+          // F5: 另一路压缩在飞行中 — 跳过本轮但不计失败 (熔断只留给真实压缩失败)
+          logger.info({
+            conversationId: parsed.conversationId,
+            round,
+            contentionCount: getCompactionContentionCount(parsed.conversationId),
+          }, '[AGENT] auto-summarize: concurrent compaction in flight — round skipped, failure fuse untouched')
+        } else if (compactionResult) {
           // 用 compacted 后的状态替换当前状态，继续后续 round
           messages = compactionResult.newMessages
           parsed.historyBlobIds = compactionResult.newBlobIds
@@ -1449,12 +1750,44 @@ export async function* handleConversationRun(
           blobIds = []
           blobCounter = 0
           nextBlobbedMessageIndex = messages.length
-          autoCompactConsecutiveFailures = 0 // 成功后重置
+
+          // 首次压缩时间戳观测 (压缩间隔 p50/p95 的输入, 事故签名 4-5 分钟/次)
+          if (firstCompactionAt === 0) {
+            firstCompactionAt = Date.now()
+          }
+          else {
+            logger.info({
+              conversationId: parsed.conversationId,
+              sinceFirstCompactionMs: Date.now() - firstCompactionAt,
+            }, '[AUTOCOMPACT] compaction interval sample')
+          }
+          // 记录基准预算 (错误驱动重试的 budget/2^retry 被除数)
+          if (compactionResult.baseBudgetTokens > 0)
+            baseKeepTailBudget = compactionResult.baseBudgetTokens
+
+          // 压缩后仍超线 = 无效压缩 (keepTail 巨物压不动), 计入熔断而非清零,
+          // 否则"每轮都成功压缩却永远降不到线下"的循环没有任何刹车
+          if (usedTokensEstimate >= autoCompactThreshold) {
+            autoCompactConsecutiveFailures++
+            lastCompactionBaseline = usedTokensEstimate
+            logger.warn({
+              conversationId: parsed.conversationId,
+              newUsedTokens: usedTokensEstimate,
+              threshold: autoCompactThreshold,
+              consecutiveFailures: autoCompactConsecutiveFailures,
+            }, '[AGENT] auto-summarize: compaction ineffective (still above threshold), counting toward fuse')
+          } else {
+            autoCompactConsecutiveFailures = 0 // 有效压缩,成功后重置
+            lastCompactionBaseline = usedTokensEstimate
+          }
 
           logger.info({
             conversationId: parsed.conversationId,
             newMessageCount: messages.length,
             newUsedTokens: usedTokensEstimate,
+            threshold: autoCompactThreshold,
+            gapToThreshold: autoCompactThreshold - usedTokensEstimate,
+            lastCompactionBaseline,
           }, '[AGENT] auto-summarize: state replaced, continuing agent loop')
         } else {
           autoCompactConsecutiveFailures++
@@ -1497,7 +1830,10 @@ export async function* handleConversationRun(
     blobIds,
   ))
 
-  usedTokensEstimate = Math.max(usedTokensEstimate, estimateMessagesTokens(messages))
+  const finalCharsLatch = estimateMessagesTokens(messages)
+  if (finalCharsLatch > usedTokensEstimate)
+    estimateSource = 'chars/4'
+  usedTokensEstimate = Math.max(usedTokensEstimate, finalCharsLatch)
 
   const finalTurnBlob = activeTurn?.materializeTurnBlob()
   if (finalTurnBlob)

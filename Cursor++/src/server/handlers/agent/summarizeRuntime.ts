@@ -6,10 +6,11 @@ import { heartbeat, checkpoint, kvMessage, summary, summaryCompleted, summarySta
 import { clampTokenDetails, computeContextUsagePercent } from './usage';
 import { resolveProviderRuntime } from '../llm';
 import { hydrateHistoryEntries, repairHistoryEntries } from './historyManager';
-import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from './compactionStrategy';
+import { buildSummarySource, createCompactionArtifacts, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy';
+import { releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock';
+import { HEARTBEAT_TICK, pumpWithTimedHeartbeats } from './conversationRuntime';
 import { executePreCompactHook } from './hookRuntime';
 import { persistConversationCheckpoint } from '../../database/checkpoints';
-import { SUMMARY_SYSTEM_PROMPT, buildSummaryUserMessage } from './summaryPrompt';
 import { logger } from '../../logger';
 
 export async function* handleSummarizeAction(
@@ -17,13 +18,31 @@ export async function* handleSummarizeAction(
     session: AgentSession | null,
 ): AsyncIterable<AgentServerMessage> {
     const route = resolveProviderRuntime(parsed.modelId);
+    // 并发互斥 (设计文档 §7#7): 等待 inline 压缩释放后再重新评估是否仍需压缩
+    await waitForCompactionLockRelease(parsed.conversationId);
+    if (!tryAcquireCompactionLock(parsed.conversationId))
+        logger.warn({ conversationId: parsed.conversationId }, '[AUTOCOMPACT] summarizeAction lock contention — proceeding after wait');
+    try {
+        yield* handleSummarizeActionLocked(parsed, session, route);
+    }
+    finally {
+        releaseCompactionLock(parsed.conversationId);
+    }
+}
+
+async function* handleSummarizeActionLocked(
+    parsed: ParsedRunRequest,
+    session: AgentSession | null,
+    route: ReturnType<typeof resolveProviderRuntime>,
+): AsyncIterable<AgentServerMessage> {
     const hydratedHistoryEntries = hydrateHistoryEntries(parsed.historyBlobIds);
     const missingHistoryBlobs = Math.max(0, parsed.historyBlobIds.length - hydratedHistoryEntries.length);
     const historyEntries = repairHistoryEntries(hydratedHistoryEntries);
-    const compactionPlan = planCompaction(historyEntries);
+    const contextTokenLimit = parsed.historyTokenDetails?.maxTokens ?? parsed.contextTokenLimit ?? route.contextTokenLimit;
+    const compactionPlan = planCompaction(historyEntries, { contextTokenLimit });
     const currentTokenDetails = clampTokenDetails(
-        parsed.historyTokenDetails?.usedTokens ?? estimateMessagesTokens(historyEntries.map(entry => entry.message)),
-        parsed.historyTokenDetails?.maxTokens ?? parsed.contextTokenLimit ?? route.contextTokenLimit,
+        parsed.historyTokenDetails?.usedTokens ?? measureMessagesTokens(historyEntries.map(entry => entry.message)),
+        contextTokenLimit,
     );
     const contextUsagePercent = computeContextUsagePercent(currentTokenDetails.usedTokens, currentTokenDetails.maxTokens);
     const generationId = randomUUID();
@@ -67,6 +86,15 @@ export async function* handleSummarizeAction(
             missingHistoryBlobs,
         }, '[AGENT] summarizeAction skipped due to incomplete history');
 
+        logger.info({
+            conversationId: parsed.conversationId,
+            origin: 'client_summarize',
+            kind: 'committed',
+            usedTokens: currentTokenDetails.usedTokens,
+            maxTokens: currentTokenDetails.maxTokens,
+            rootBlobCount: parsed.historyBlobIds.length,
+            summaryArchiveCount: parsed.historySummaryArchiveIds.length,
+        }, '[AUTOCOMPACT] checkpoint write');
         persistConversationCheckpoint({
             kind: 'committed',
             conversationId: parsed.conversationId,
@@ -98,6 +126,24 @@ export async function* handleSummarizeAction(
     }
 
     if (compactionPlan.summarizeEntries.length === 0) {
+        // F2: mode==='disabled' 时 plan 同样返回空 summarizeEntries, 但语义是
+        // "压缩结构性不可行" (leading 过大/窗口过小), 不是"已经够紧凑" — 文案须区分
+        if (compactionPlan.mode === 'disabled') {
+            logger.warn({
+                conversationId: parsed.conversationId,
+                contextTokenLimit,
+                leadingTokens: compactionPlan.diagnostics.leadingTokens,
+            }, '[AUTOCOMPACT] summarizeAction skipped — compaction structurally infeasible for this window');
+        }
+        logger.info({
+            conversationId: parsed.conversationId,
+            origin: 'client_summarize',
+            kind: 'committed',
+            usedTokens: currentTokenDetails.usedTokens,
+            maxTokens: currentTokenDetails.maxTokens,
+            rootBlobCount: parsed.historyBlobIds.length,
+            summaryArchiveCount: parsed.historySummaryArchiveIds.length,
+        }, '[AUTOCOMPACT] checkpoint write');
         persistConversationCheckpoint({
             kind: 'committed',
             conversationId: parsed.conversationId,
@@ -109,7 +155,9 @@ export async function* handleSummarizeAction(
             updatedAt: Date.now(),
         });
 
-        yield summaryCompleted(hookMessage ?? 'Conversation already compact enough.');
+        yield summaryCompleted(hookMessage ?? (compactionPlan.mode === 'disabled'
+            ? 'Compaction unavailable: system prompt plus reserves exceed this model\'s usable context window. Consider a larger-context model.'
+            : 'Conversation already compact enough.'));
         yield checkpoint(
             parsed.historyBlobIds,
             currentTokenDetails.usedTokens,
@@ -128,10 +176,8 @@ export async function* handleSummarizeAction(
         return;
     }
 
-    const summarySourceText = compactionPlan.summarizeEntries
-        .map(entry => formatMessageForSummary(entry.message))
-        .filter(text => text.length > 0)
-        .join('\n\n');
+    // 摘要源构造 (阶段 4): 总预算 min(0.6×窗口×4, 3.2e6) chars, 超限走 max-min 水位分配
+    const summarySourceText = buildSummarySource(compactionPlan.summarizeEntries, { contextTokenLimit });
 
     let summaryText = '';
     const llmStartTime = Date.now();
@@ -143,30 +189,25 @@ export async function* handleSummarizeAction(
         keepTail: compactionPlan.keepTail.length,
     }, '[SUMMARIZE] LLM summary starting');
 
-    let lastHeartbeatTime = Date.now();
-    try {
-        const llmStream = route.provider.stream({
-            model: route.model,
-            thinking: false,
-            messages: [
-                { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-                { role: 'user', content: buildSummaryUserMessage(summarySourceText) },
-            ],
-        });
-
-        for await (const event of llmStream) {
-            if (event.type === 'text_delta') {
-                summaryText += event.text;
-                yield summary(event.text);
-            }
-            // LLM 生成期间持续 yield heartbeat, 防止客户端 stall detector 误判
-            if (Date.now() - lastHeartbeatTime >= 4000) {
-                yield heartbeat();
-                lastHeartbeatTime = Date.now();
-            }
+    // 三级兜底 (流式, 与 inline 路径同一实现 — 两路行为一致)。
+    // 心跳定时驱动 (与 inline 路径同修): 思考模型零事件期若心跳饿死,
+    // 客户端 ~93s stall 判死会弃 run 作废在飞行摘要。
+    for await (const summaryEvent of pumpWithTimedHeartbeats(streamSummaryWithFallback({
+        provider: route.provider,
+        model: route.model,
+        sourceText: summarySourceText,
+        contextTokenLimit,
+    }))) {
+        if (summaryEvent === HEARTBEAT_TICK) {
+            yield heartbeat();
+            continue;
         }
-    } catch (error) {
-        logger.warn({ error: (error as Error).message, durationMs: Date.now() - llmStartTime }, '[SUMMARIZE] LLM failed, falling back to local summary');
+        if (summaryEvent.type === 'delta') {
+            summaryText += summaryEvent.text;
+            yield summary(summaryEvent.text);
+        }
+        if (summaryEvent.type === 'done')
+            summaryText = summaryEvent.text;
     }
 
     logger.info({
@@ -174,21 +215,6 @@ export async function* handleSummarizeAction(
         summaryLen: summaryText.length,
         durationMs: Date.now() - llmStartTime,
     }, '[SUMMARIZE] LLM summary done');
-
-    summaryText = summaryText.trim();
-    if (!summaryText) {
-        summaryText = summarySourceText
-            .split('\n')
-            .map(line => line.trim())
-            .filter(Boolean)
-            .slice(0, 12)
-            .map(line => `- ${line.replace(/^-\s*/, '')}`)
-            .join('\n')
-            .slice(0, 4000);
-    }
-    if (!summaryText) {
-        summaryText = '- Prior conversation compacted.';
-    }
 
     const artifacts = createCompactionArtifacts({
         plan: compactionPlan,
@@ -202,7 +228,8 @@ export async function* handleSummarizeAction(
     }
 
     const compactedUsedTokens = clampTokenDetails(
-        estimateMessagesTokens([
+        // o200k 实测重置 (与 inline 路径同口径, 两路行为一致由单一实现保证)
+        measureMessagesTokens([
             ...compactionPlan.leading.map(entry => entry.message),
             { role: 'assistant', content: `Previous conversation summary:\n${artifacts.summaryText}` },
             ...compactionPlan.keepTail.map(entry => entry.message),
@@ -210,6 +237,15 @@ export async function* handleSummarizeAction(
         currentTokenDetails.maxTokens,
     );
 
+    logger.info({
+        conversationId: parsed.conversationId,
+        origin: 'client_summarize',
+        kind: 'committed',
+        usedTokens: compactedUsedTokens.usedTokens,
+        maxTokens: compactedUsedTokens.maxTokens,
+        rootBlobCount: artifacts.nextRootBlobIds.length,
+        summaryArchiveCount: artifacts.nextSummaryArchiveIds.length,
+    }, '[AUTOCOMPACT] checkpoint write');
     persistConversationCheckpoint({
         kind: 'committed',
         conversationId: parsed.conversationId,
